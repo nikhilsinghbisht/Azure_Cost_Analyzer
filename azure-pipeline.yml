@@ -87,7 +87,7 @@ jobs:
   - job: DailyCostScan
     displayName: 'Scan all subscriptions & resource groups'
     pool:
-      name: 'Default'           # Self-hosted agent pool (set up on your own machine)
+      vmImage: 'ubuntu-latest'           # Self-hosted agent pool (set up on your own machine)
       # To switch to Microsoft-hosted (requires paid parallelism):
       # vmImage: 'ubuntu-latest'
     timeoutInMinutes: 180       # full tenant scan can be slow
