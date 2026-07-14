@@ -1,0 +1,200 @@
+# ============================================================
+# AI Cloud Cost Detective — Azure DevOps Daily Scan Pipeline
+# ============================================================
+#
+# Setup steps (do once in Azure DevOps):
+# ---------------------------------------------------------------
+# 1. Go to Pipelines → Library → Variable Groups
+# 2. Create a group named: "azure-cost-detective-secrets"
+# 3. Add the following variables (mark secret where noted):
+#
+#    Name                    | Secret? | Value
+#    ------------------------|---------|------------------------
+#    AZURE_TENANT_ID         | No      | your-tenant-uuid
+#    AZURE_CLIENT_ID         | No      | your-sp-client-id
+#    AZURE_CLIENT_SECRET     | Yes ★   | your-sp-client-secret
+#    AZURE_SUBSCRIPTION_ID   | No      | your-default-sub-id
+#    OPENAI_API_KEY          | Yes ★   | sk-proj-...
+#    DATABASE_URL            | Yes ★   | postgresql://user:pass@host/db?sslmode=require
+#    JWT_SECRET              | Yes ★   | your-jwt-secret
+#
+# 4. Create this pipeline in Azure DevOps:
+#    Pipelines → New Pipeline → Azure Repos Git → select repo
+#    → Existing YAML file → /azure-pipelines.yml
+#
+# 5. Grant the SP "Reader" + "Cost Management Reader" at the
+#    Management Group level so it can see ALL subscriptions.
+#    (See MULTI-SUBSCRIPTION SETUP below.)
+# ---------------------------------------------------------------
+#
+# Multi-subscription coverage
+# ---------------------------------------------------------------
+# The pipeline calls list_subscriptions() which hits:
+#   GET https://management.azure.com/subscriptions?api-version=2022-12-01
+# This returns EVERY subscription the service principal has access to.
+# The default AZURE_SUBSCRIPTION_ID in env is only used as a fallback.
+# ---------------------------------------------------------------
+
+name: 'AzureCostScan_$(Date:yyyyMMdd)_$(Rev:r)'
+
+# ─── Triggers ────────────────────────────────────────────────────────────────
+
+trigger: none          # No auto-trigger on code push
+
+schedules:
+  - cron: '0 6 * * *'           # 06:00 UTC = 11:30 IST, every day
+    displayName: 'Daily 06:00 UTC scan'
+    branches:
+      include:
+        - test
+    always: true                 # Run even if code hasn't changed
+
+# ─── Manual run parameters ───────────────────────────────────────────────────
+
+parameters:
+  - name: subscriptionIds
+    displayName: 'Subscription IDs to scan (comma-separated, "all" = scan everything)'
+    type: string
+    default: 'all'
+
+  - name: resourceGroups
+    displayName: 'Resource Groups to filter (comma-separated, "all" = scan everything)'
+    type: string
+    default: 'all'
+
+  - name: skipDatabase
+    displayName: 'Skip saving results to database?'
+    type: boolean
+    default: false
+
+  - name: openaiModel
+    displayName: 'OpenAI model override ("default" = use env setting)'
+    type: string
+    default: 'default'
+
+# ─── Variable groups ─────────────────────────────────────────────────────────
+
+variables:
+  - group: azure-cost-detective-secrets
+  - name: pythonVersion
+    value: '3.11'
+  - name: reportOutputDir
+    value: '$(Build.ArtifactStagingDirectory)/cost-reports'
+
+# ─── Jobs ────────────────────────────────────────────────────────────────────
+
+jobs:
+  - job: DailyCostScan
+    displayName: 'Scan all subscriptions & resource groups'
+    pool:
+      name: 'Default'           # Self-hosted agent pool (set up on your own machine)
+      # To switch to Microsoft-hosted (requires paid parallelism):
+      # vmImage: 'ubuntu-latest'
+    timeoutInMinutes: 180       # full tenant scan can be slow
+
+    steps:
+
+      # ── 1. Create venv and install dependencies ───────────────────────────
+      # Uses system Python3 on the self-hosted VM (no UsePythonVersion needed)
+      - bash: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -r backend/requirements.txt
+          echo "##vso[task.setvariable variable=PYTHON].venv/bin/python"
+        displayName: 'Set up virtual environment and install dependencies'
+        workingDirectory: $(System.DefaultWorkingDirectory)
+
+      # ── 3. Build pipeline CLI arguments ───────────────────────────────────
+      - bash: |
+          ARGS="--output-dir $(reportOutputDir)"
+
+          # Subscription filter — "all" means scan everything (no flag needed)
+          SUB_IDS="${{ parameters.subscriptionIds }}"
+          if [ -n "$SUB_IDS" ] && [ "$SUB_IDS" != "all" ]; then
+            FORMATTED=$(echo "$SUB_IDS" | tr ',' ' ')
+            ARGS="$ARGS --subscription-ids $FORMATTED"
+          fi
+
+          # Resource-group filter — "all" means scan everything (no flag needed)
+          RG_NAMES="${{ parameters.resourceGroups }}"
+          if [ -n "$RG_NAMES" ] && [ "$RG_NAMES" != "all" ]; then
+            FORMATTED=$(echo "$RG_NAMES" | tr ',' ' ')
+            ARGS="$ARGS --resource-groups $FORMATTED"
+          fi
+
+          # Skip DB flag
+          if [ "${{ parameters.skipDatabase }}" = "True" ]; then
+            ARGS="$ARGS --no-db"
+          fi
+
+          # OpenAI model — use override or fall back to gpt-4o
+          MODEL="${{ parameters.openaiModel }}"
+          if [ "$MODEL" != "default" ] && [ -n "$MODEL" ]; then
+            echo "##vso[task.setvariable variable=openaiModelOverride]$MODEL"
+          else
+            echo "##vso[task.setvariable variable=openaiModelOverride]gpt-4o"
+          fi
+
+          echo "##vso[task.setvariable variable=pipelineArgs]$ARGS"
+          echo "Pipeline will run with args: $ARGS"
+        displayName: 'Build pipeline arguments'
+
+      # ── 4. Create output directory ────────────────────────────────────────
+      - bash: mkdir -p "$(reportOutputDir)"
+        displayName: 'Create report output directory'
+
+      # ── 5. Run the cost scan pipeline ────────────────────────────────────
+      - bash: |
+          $(System.DefaultWorkingDirectory)/$(PYTHON) pipeline.py $(pipelineArgs)
+        displayName: 'Run daily cost scan'
+        workingDirectory: $(System.DefaultWorkingDirectory)/backend
+        env:
+          # Azure credentials (from variable group)
+          AZURE_TENANT_ID:        $(AZURE_TENANT_ID)
+          AZURE_CLIENT_ID:        $(AZURE_CLIENT_ID)
+          AZURE_CLIENT_SECRET:    $(AZURE_CLIENT_SECRET)
+          AZURE_SUBSCRIPTION_ID:  $(AZURE_SUBSCRIPTION_ID)
+          # OpenAI
+          OPENAI_API_KEY:         $(OPENAI_API_KEY)
+          OPENAI_MODEL:           $(openaiModelOverride)
+          # Database
+          DATABASE_URL:           $(DATABASE_URL)
+          JWT_SECRET:             $(JWT_SECRET)
+
+      # ── 6. List generated reports ─────────────────────────────────────────
+      - bash: |
+          echo "=== Generated Excel Reports ==="
+          ls -lh "$(reportOutputDir)"/*.xlsx 2>/dev/null || echo "No Excel files found."
+          COUNT=$(ls "$(reportOutputDir)"/*.xlsx 2>/dev/null | wc -l)
+          echo "Total reports: $COUNT"
+          echo "##vso[task.setvariable variable=reportCount]$COUNT"
+        displayName: 'List generated reports'
+        condition: always()
+
+      # ── 7. Publish Excel reports as pipeline artifacts ────────────────────
+      # After pipeline completes, go to:
+      #   Pipelines → select this run → Artifacts → cost-reports
+      # to download all Excel files.
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Excel reports as artifacts'
+        condition: always()
+        inputs:
+          targetPath: '$(reportOutputDir)'
+          artifact: 'cost-reports'
+          publishLocation: 'pipeline'
+
+      # ── 8. Print pipeline summary ─────────────────────────────────────────
+      - bash: |
+          echo "##[section]Azure Cost Detective — Scan Complete"
+          echo ""
+          echo "Run date : $(date -u '+%Y-%m-%d %H:%M UTC')"
+          echo "Trigger  : $(Build.Reason)"
+          echo "Branch   : $(Build.SourceBranchName)"
+          echo ""
+          echo "Excel reports are available under:"
+          echo "  Pipelines → This Run → Artifacts → cost-reports"
+          echo ""
+          echo "Results are also saved to the PostgreSQL database"
+          echo "(unless --no-db was passed)."
+        displayName: 'Pipeline summary'
+        condition: always()
