@@ -3,21 +3,41 @@ rules_engine.py
 ---------------
 Deterministic, rule-based cost & security detection.
 
-Why this exists
----------------
-Relying only on the AI (LLM) to find issues produces inconsistent results:
-the same resources can yield different findings on different runs, and the
-model sometimes silently skips resources. For a client-facing product we need
-GUARANTEED, reproducible findings.
+Each rule reads a resource's enriched data (from azure_scanner) and returns a
+list of "issue" dicts. Same input always gives the same output, so results are
+reproducible. The AI layer merges these with its own findings.
 
-This engine runs a fixed set of hand-written rules directly against the
-enriched resource data from azure_scanner. Every rule is deterministic:
-same input → same output, every single time. The AI layer then adds
-narrative polish and catches anything nuanced, but the baseline findings
-here are always present.
 
-Each rule returns an "issue" dict matching the schema used by ai_analyzer,
-so the two sources can be merged seamlessly.
+HOW TO ADD A RECOMMENDATION
+---------------------------
+1. (Only if you need new data) Add the field in azure_scanner.py so the
+   resource dict carries it, e.g. res["my_flag"].
+
+2. Write a rule function that returns a list of _issue(...) calls:
+
+       def _rule_myservice(res: dict) -> list[dict]:
+           out = []
+           if res.get("my_flag"):                       # your condition
+               out.append(_issue(
+                   res,
+                   category="Cost Saving",              # see recommendation.CATEGORIES
+                   issue="Short human explanation of the problem.",
+                   fix_commands=["az ... --name {name} --resource-group {rg}"],
+                   savings_ratio=_TIER_DOWNGRADE_RATIO,  # or 0 for security-only
+                   # optional extras: title=, current_config=, recommended_config=,
+                   # evidence=, reversible=, destructive=, keep_at_zero=, doc=
+               ))
+           return out
+
+   To ADD a recommendation to an EXISTING resource, just append another
+   _issue(...) inside that resource's existing _rule_xxx function.
+
+3. Register the function in the _RULES table (bottom of file):
+
+       "microsoft.myprovider/mytype": _rule_myservice,
+
+That's it. {name}/{rg} in fix_commands are filled in automatically, and
+scoring/ranking/dedup happen for you.
 """
 
 from __future__ import annotations
@@ -53,9 +73,7 @@ _LIFECYCLE_RATIO = 0.30        # blob tiering to Cool/Archive
 _MINOR_CONFIG_RATIO = 0.15     # small config tweaks
 
 
-# Rough Azure list prices (USD/GB/month) for managed disks — used ONLY as a
-# fallback when no live billing/retail data is available, so cost-saving
-# estimates are never silently $0 for known paid resources.
+# Fallback list prices (USD/GB/month) for managed disks when no live data.
 _DISK_GB_RATE = {
     "premium": 0.15,       # Premium SSD (~$0.15/GB/mo)
     "standardssd": 0.075,  # Standard SSD
@@ -76,6 +94,8 @@ _vm_price_cache: dict[str, dict] = {}
 _RESERVED_RATIO = 0.37
 # Moving a general-purpose/compute VM down to a Burstable B-series (typical)
 _VM_RIGHTSIZE_RATIO = 0.40
+# Azure Hybrid Benefit removes the Windows license portion (~40% of a Win VM).
+_HYBRID_BENEFIT_RATIO = 0.40
 
 
 def _vm_prices(vm_size: str | None, location: str | None) -> dict:
@@ -646,7 +666,7 @@ def _issue(
     savings_ratio: float,
     is_security_only: bool = False,
     reasoning: str | None = None,
-    # ── rich recommendation metadata (all optional, sensible defaults) ────────
+    # optional rich metadata
     title: str | None = None,
     current_config: str | None = None,
     recommended_config: str | None = None,
@@ -661,14 +681,7 @@ def _issue(
     keep_at_zero: bool = False,
     current_cost_override: float | None = None,
 ) -> dict:
-    """Build a normalized recommendation dict.
-
-    Backward compatible: still emits every legacy field the Excel exporter / DB
-    / frontend consume (resource_name, severity, category, issue,
-    *_monthly_cost_usd, savings_reasoning, fix_commands). Adds rich, scored
-    fields (title, description, reason, current/recommended config, confidence,
-    risk, priority, doc_url) on top.
-    """
+    """Build one recommendation dict (legacy fields + scored rich fields)."""
     rg = res.get("resource_group", "")
     name = res.get("name", "")
     rtype = res.get("type", "")
@@ -722,7 +735,7 @@ def _issue(
         severity = {"P1": "high", "P2": "medium", "P3": "low", "P4": "low"}[plabel]
 
     return {
-        # ── legacy fields (unchanged contract) ──────────────────────────────
+        # legacy fields
         "resource_name": name,
         "resource_type": rtype,
         "severity": severity,
@@ -733,7 +746,7 @@ def _issue(
         "estimated_monthly_savings_usd": savings,
         "savings_reasoning": reasoning,
         "fix_commands": [c.replace("{rg}", rg).replace("{name}", name) for c in fix_commands],
-        # ── rich recommendation fields (additive) ───────────────────────────
+        # rich fields
         "title": title or issue[:80],
         "description": issue,
         "reason": reasoning,
@@ -744,11 +757,11 @@ def _issue(
         "risk_level": risk,
         "priority": plabel,
         "documentation_url": _doc_url(doc),
-        # ── internal bookkeeping (stripped before returning to client) ──────
+        # internal only (stripped before returning to client)
         "_source": "rules_engine",
         "_priority_score": pscore,
         "_exclusive_group": exclusive_group,
-        "_keep_at_zero": is_security_only or keep_at_zero,  # keep even at $0
+        "_keep_at_zero": is_security_only or keep_at_zero,
     }
 
 
@@ -757,17 +770,9 @@ def _issue(
 # ---------------------------------------------------------------------------
 
 def _vm_cost_candidates(res: dict) -> list[dict]:
-    """Emit MULTIPLE ranked cost recommendations for one running VM.
-
-    All compute levers share the exclusive group 'vm-compute' so the report can
-    show several ranked options while the SAVINGS TOTAL only counts the single
-    best one (you apply one strategy, not all at once). Options considered:
-      • dynamic downsize to a specific cheaper SKU (evidence: real CPU),
-      • move to a Burstable B-series,
-      • purchase a Reserved Instance / Savings Plan (always-on),
-      • enable auto-shutdown (non-production only),
-      • move to Spot (non-production / interruptible only).
-    """
+    """Ranked cost options for a running VM (downsize / B-series / RI / spot /
+    auto-shutdown). Compute levers share group 'vm-compute' so the savings total
+    counts only the best one, not all at once."""
     out: list[dict] = []
     size = res.get("vm_size")
     loc = res.get("location")
@@ -836,6 +841,28 @@ def _vm_cost_candidates(res: dict) -> list[dict]:
                 f"{size} costs {base}.{cpu_txt} A 1-yr commitment cuts ~{int(_RESERVED_RATIO*100)}% "
                 f"for steady-state, always-on compute."
             ),
+        ))
+
+    # 2b) Azure Hybrid Benefit — Windows VM paying full license (no licenseType).
+    os_type = (res.get("vm_os_type") or "").lower()
+    lic = (res.get("vm_license_type") or "").lower()
+    if os_type == "windows" and "windows" not in lic:
+        out.append(_issue(
+            res,
+            category="Cost Saving",
+            title="Apply Azure Hybrid Benefit",
+            issue=("Windows VM is paying the full license — if you own Windows Server "
+                   "licenses with Software Assurance, Azure Hybrid Benefit removes that cost."),
+            fix_commands=["az vm update --resource-group {rg} --name {name} --license-type Windows_Server"],
+            savings_ratio=_HYBRID_BENEFIT_RATIO,
+            current_config="Pay-as-you-go Windows license",
+            recommended_config="Azure Hybrid Benefit (bring your own license)",
+            evidence="heuristic",
+            reversible=True,
+            doc="vm_reserved",
+            exclusive_group=grp,
+            reasoning="Azure Hybrid Benefit drops the Windows license portion (~40%) for VMs "
+                      "covered by Software Assurance.",
         ))
 
     # 3) Spot — only for clearly non-production / interruptible workloads.
@@ -1106,6 +1133,21 @@ def _rule_storage(res: dict) -> list[dict]:
             fix_commands=["# Migrate tables to a Standard storage account"],
             savings_ratio=_TIER_DOWNGRADE_RATIO,
         ))
+
+    # Large, stable Standard blob usage → reserved capacity (1/3-yr commitment).
+    gb = res.get("used_capacity_gb") or 0
+    if gb >= 1024 and "premium" not in (res.get("storage_sku") or "").lower():
+        out.append(_issue(
+            res, severity="low", category="Cost Saving",
+            title="Buy storage reserved capacity",
+            issue=(f"~{gb/1024:.0f} TB of Standard storage on pay-as-you-go — a 1 or 3-year "
+                   f"reserved-capacity commitment discounts steady-state data at rest."),
+            fix_commands=["# Azure Portal -> Reservations -> Add -> Azure Blob Storage / Files reserved capacity"],
+            savings_ratio=0.20,
+            current_config=f"~{gb/1024:.0f} TB pay-as-you-go",
+            recommended_config="Reserved capacity (1 or 3-year term)",
+            evidence="heuristic", reversible=False,
+        ))
     return out
 
 
@@ -1344,9 +1386,7 @@ def _rule_keyvault(res: dict) -> list[dict]:
             savings_ratio=0, is_security_only=True,
         ))
 
-    # High transaction volume — Key Vault is billed per 10k operations. Chatty
-    # apps that fetch the same secret on every request drive avoidable cost;
-    # caching secrets in memory (with a TTL) collapses most of these hits.
+    # Key Vault is billed per 10k operations, so high volume is avoidable cost.
     hits = res.get("kv_api_hits_30d")
     if isinstance(hits, (int, float)) and hits >= 3_000_000:
         op_cost = round(hits / 10_000 * _KV_OP_RATE, 2)   # standard transaction rate
@@ -1418,8 +1458,7 @@ def _rule_rsv(res: dict) -> list[dict]:
             savings_ratio=_IDLE_DELETE_RATIO,
         ))
     if (res.get("rsv_redundancy") or "") == "GeoRedundant":
-        # Only the backup-storage portion changes with redundancy; the
-        # per-instance fee stays the same. Compute the storage-only saving.
+        # Only the storage portion changes with redundancy, not the instance fee.
         gb = res.get("rsv_storage_used_gb") or 0
         total = _cost(res)
         reasoning = None
@@ -1442,9 +1481,7 @@ def _rule_rsv(res: dict) -> list[dict]:
             doc="rsv_redundancy",
         ))
 
-    # Long DAILY retention keeps many recovery points and is the biggest driver
-    # of backup-storage cost. Reducing it (using weekly/monthly for older points)
-    # cuts stored data for non-compliance workloads.
+    # Long daily retention drives backup-storage cost.
     daily = res.get("rsv_max_daily_retention_days")
     if isinstance(daily, int) and daily > 30:
         gb = res.get("rsv_storage_used_gb") or 0
