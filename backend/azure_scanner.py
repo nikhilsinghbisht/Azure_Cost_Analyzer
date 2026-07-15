@@ -389,11 +389,16 @@ def _enrich_resource(res: dict, token: str) -> dict:
             # this exposes SSH/RDP etc. straight to the internet.
             try:
                 vm_full = _arm_get(rid, token, "2023-09-01")
+                vm_props = vm_full.get("properties", {})
                 extra["vm_size"] = (
-                    vm_full.get("properties", {})
-                    .get("hardwareProfile", {})
-                    .get("vmSize")
+                    vm_props.get("hardwareProfile", {}).get("vmSize")
                 )
+                # OS + license: Windows VM with no licenseType = paying full
+                # license, so Azure Hybrid Benefit can apply.
+                extra["vm_os_type"] = (
+                    vm_props.get("storageProfile", {}).get("osDisk", {}).get("osType")
+                )
+                extra["vm_license_type"] = vm_props.get("licenseType")
                 nic_refs = (vm_full.get("properties", {})
                             .get("networkProfile", {})
                             .get("networkInterfaces", []))
