@@ -163,7 +163,7 @@ full list with **what it checks** and an **example recommendation**.
 | # | Service | What the rule checks | Example recommendation |
 |---|---------|----------------------|------------------------|
 | 10 | **Storage Account** | tier, redundancy, used GB, lifecycle, public access, TLS, soft-delete | "Premium → Standard (save $X on 500 GB)", "GRS → LRS for non-critical", "Add lifecycle policy", "Buy reserved capacity (≥1 TB)", "Disable public blob access" |
-| 11 | **Managed Disk** | attached?, SKU, size | "Delete unattached disk (100% waste)", "Premium SSD → Standard SSD (exact $ delta)" |
+| 11 | **Managed Disk** | attached?, SKU, size, IOPS util | "Delete unattached disk (100% waste)", "Premium SSD → Standard SSD (only when measured IOPS are low)" |
 | 12 | **Snapshot** | age, size, incremental | "Delete 190-day-old snapshot — forgotten backup" |
 
 ### Network
