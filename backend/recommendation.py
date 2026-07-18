@@ -48,6 +48,7 @@ CATEGORIES = {
     "Cost Saving",
     "Performance",
     "Security",
+    "Governance",
 }
 
 # Map every legacy rules-engine category onto a canonical one.
@@ -61,7 +62,9 @@ _CATEGORY_ALIAS = {
     "optimization opportunity": "Cost Saving",
     "misconfigured": "Performance",
     "security risk": "Security",
-    "tagging / governance": "Cost Saving",
+    # Tagging is governance (no $ savings) — never map to Cost Saving.
+    "tagging / governance": "Governance",
+    "governance": "Governance",
 }
 
 # Risk → multiplier for the priority score. Low-risk actions are preferred at
