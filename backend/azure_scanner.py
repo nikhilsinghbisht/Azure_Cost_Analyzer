@@ -445,6 +445,55 @@ def _enrich_resource(res: dict, token: str) -> dict:
             extra["is_orphaned"] = not bool(disk.get("managedBy"))
             extra["disk_size_gb"] = props.get("diskSizeGB")
             extra["disk_sku"] = (disk.get("sku") or {}).get("name")
+            # IOPS utilisation — used to gate Premium → Standard recommendations.
+            # Sum read + write Composite Disk Operations/sec over ~30 days.
+            try:
+                now = datetime.now(timezone.utc)
+                start = now - timedelta(days=30)
+                timespan = f"{start:%Y-%m-%dT%H:%M:%SZ}/{now:%Y-%m-%dT%H:%M:%SZ}"
+                read_ops = write_ops = None
+                for metric in (
+                    "Composite Disk Read Operations/sec",
+                    "Composite Disk Write Operations/sec",
+                ):
+                    data = _arm_get(
+                        f"{rid}/providers/microsoft.insights/metrics",
+                        token, "2023-10-01",
+                        params={
+                            "metricnames": metric,
+                            "aggregation": "Average,Maximum",
+                            "interval": "P1D",
+                            "timespan": timespan,
+                        },
+                    )
+                    vals = data.get("value", [])
+                    series = (vals[0].get("timeseries", []) if vals else [])
+                    pts = series[0].get("data", []) if series else []
+                    avgs = [p.get("average") for p in pts if p.get("average") is not None]
+                    maxs = [p.get("maximum") for p in pts if p.get("maximum") is not None]
+                    if metric.startswith("Composite Disk Read"):
+                        read_ops = (
+                            (sum(avgs) / len(avgs) if avgs else None),
+                            (max(maxs) if maxs else None),
+                        )
+                    else:
+                        write_ops = (
+                            (sum(avgs) / len(avgs) if avgs else None),
+                            (max(maxs) if maxs else None),
+                        )
+                if read_ops or write_ops:
+                    r_avg, r_max = read_ops or (0, 0)
+                    w_avg, w_max = write_ops or (0, 0)
+                    r_avg = r_avg or 0
+                    w_avg = w_avg or 0
+                    r_max = r_max or 0
+                    w_max = w_max or 0
+                    # Only set if we actually got at least one series with data.
+                    if (read_ops and read_ops[0] is not None) or (write_ops and write_ops[0] is not None):
+                        extra["disk_iops_avg"] = round(r_avg + w_avg, 1)
+                        extra["disk_iops_max"] = round(r_max + w_max, 1)
+            except Exception:
+                pass
 
         elif rtype == "microsoft.network/publicipaddresses":
             pip = _arm_get(rid, token, "2023-09-01")
