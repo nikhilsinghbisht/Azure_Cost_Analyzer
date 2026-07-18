@@ -89,6 +89,7 @@ export type IssueCategory =
   | 'Cost Saving'
   | 'Performance'
   | 'Security'
+  | 'Governance'
   // Legacy categories (kept so previously-stored analyses still render)
   | 'Over-provisioned'
   | 'Unused / Idle'
