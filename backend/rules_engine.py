@@ -238,6 +238,68 @@ def _disk_tier_num(size_gb: float) -> int:
     return 80
 
 
+# Provisioned IOPS by performance-tier number (Premium P* / Standard SSD E*).
+_PREMIUM_IOPS = {
+    1: 120, 2: 120, 3: 120, 4: 120, 6: 240, 10: 500, 15: 1100, 20: 2300,
+    30: 5000, 40: 7500, 50: 7500, 60: 16000, 70: 18000, 80: 20000,
+}
+_STANDARD_SSD_IOPS = {
+    1: 120, 2: 120, 3: 120, 4: 120, 6: 240, 10: 500, 15: 500, 20: 500,
+    30: 500, 40: 2000, 50: 4000, 60: 6000, 70: 8000, 80: 12000,
+}
+# Peak IOPS must stay under this share of Premium provisioned to call it under-used.
+_DISK_IOPS_UTIL_CEILING = 0.20
+
+
+def _disk_provisioned_iops(size_gb: float | None, family: str) -> int | None:
+    if not size_gb:
+        return None
+    tier = _disk_tier_num(size_gb)
+    table = _PREMIUM_IOPS if family == "P" else _STANDARD_SSD_IOPS
+    return table.get(tier)
+
+
+def _disk_iops_underused(res: dict) -> bool | None:
+    """True = measured IOPS low → safe to drop Premium → Standard SSD.
+    False = disk is busy enough to need Premium.
+    None = no metric data."""
+    avg = res.get("disk_iops_avg")
+    mx = res.get("disk_iops_max")
+    if avg is None and mx is None:
+        return None
+    peak = mx if mx is not None else avg
+    size = res.get("disk_size_gb")
+    premium_iops = _disk_provisioned_iops(size, "P")
+    standard_iops = _disk_provisioned_iops(size, "E")
+    if not premium_iops or peak is None:
+        return None
+    # Under-used if peak is a small fraction of Premium AND fits under Standard SSD.
+    util = peak / premium_iops
+    fits_standard = standard_iops is None or peak <= standard_iops * 0.8
+    if util < _DISK_IOPS_UTIL_CEILING and fits_standard:
+        return True
+    return False
+
+
+def _disk_iops_text(res: dict) -> str:
+    """Human-readable IOPS evidence (empty if no data)."""
+    avg = res.get("disk_iops_avg")
+    mx = res.get("disk_iops_max")
+    size = res.get("disk_size_gb")
+    prem = _disk_provisioned_iops(size, "P")
+    parts = []
+    if avg is not None:
+        parts.append(f"avg {avg:.0f} IOPS")
+    if mx is not None:
+        parts.append(f"peak {mx:.0f} IOPS")
+    if not parts:
+        return ""
+    base = f" Measured disk {', '.join(parts)} over ~30 days"
+    if prem and mx is not None:
+        base += f" ({mx / prem * 100:.0f}% of Premium {prem} provisioned)"
+    return base + "."
+
+
 def _disk_price_monthly(size_gb: float | None, region: str | None, family_prefix: str) -> float | None:
     """Real fixed monthly price of a managed disk of the given size + family."""
     if not size_gb or not region:
@@ -708,6 +770,14 @@ def _issue(
 
     canon = canonical_category(category)
 
+    # $0 hygiene/security findings must never appear as "Cost Saving".
+    if is_security_only and canon == "Cost Saving":
+        raw = (category or "").lower()
+        if "tag" in raw or "governance" in raw:
+            canon = "Governance"
+        else:
+            canon = "Security"
+
     # ── Confidence (deterministic) ────────────────────────────────────────────
     if confidence is None:
         ev = "security" if is_security_only else evidence
@@ -944,16 +1014,22 @@ def _rule_vm(res: dict) -> list[dict]:
 
 def _rule_disk(res: dict) -> list[dict]:
     out = []
-    if res.get("is_orphaned") or res.get("disk_state") == "Unattached":
+    orphaned = res.get("is_orphaned") or res.get("disk_state") == "Unattached"
+    if orphaned:
         out.append(_issue(
             res, severity="high", category="Unused / Idle",
             issue="Managed disk is unattached / orphaned (no VM owns it) — pure wasted spend.",
             fix_commands=["az disk delete --resource-group {rg} --name {name} --yes"],
             savings_ratio=_IDLE_DELETE_RATIO,
         ))
+        return out  # no point suggesting a tier change on a disk we're deleting
+
     if (res.get("disk_sku") or "").startswith("Premium"):
-        # Compute the EXACT saving from real Premium vs Standard SSD list prices
-        # for this disk's size, instead of a flat ratio.
+        # Only recommend Premium → Standard when measured IOPS are low (or unknown).
+        underused = _disk_iops_underused(res)
+        if underused is False:
+            return out  # busy Premium disk — keep it
+
         size = res.get("disk_size_gb")
         region = _region(res)
         premium = _disk_price_monthly(size, region, "P")
@@ -963,16 +1039,29 @@ def _rule_disk(res: dict) -> list[dict]:
             reasoning = (
                 f"Premium disk ({size} GB) lists at ${premium:.2f}/mo; the equivalent "
                 f"Standard SSD is ${standard:.2f}/mo → save ${premium - standard:.2f}/mo."
+                + _disk_iops_text(res)
+                + ("" if underused is True else " IOPS data limited — verify before changing SKU.")
             )
         else:
             ratio = _TIER_DOWNGRADE_RATIO
             reasoning = None
+            iops_txt = _disk_iops_text(res)
+            if iops_txt:
+                reasoning = iops_txt.strip() + (
+                    "" if underused is True else " IOPS data limited — verify before changing SKU."
+                )
+
         out.append(_issue(
-            res, severity="medium", category="Wrong Pricing Tier",
-            issue="Premium SSD disk — if this is not a latency-critical/production workload, Standard SSD is cheaper for the same capacity.",
+            res, severity="medium" if underused else "low", category="Wrong Pricing Tier",
+            title="Downgrade Premium SSD to Standard SSD",
+            issue="Premium SSD disk — measured IOPS are low enough that Standard SSD can cover the workload at lower cost.",
             fix_commands=["az disk update --resource-group {rg} --name {name} --sku StandardSSD_LRS"],
             savings_ratio=ratio,
             reasoning=reasoning,
+            current_config=f"Premium SSD {size} GB",
+            recommended_config=f"Standard SSD {size} GB",
+            evidence="metric_backed" if underused is True else "metric_missing",
+            performance_impact=True, reversible=True, doc="disk_tier",
         ))
     return out
 
@@ -1114,7 +1203,7 @@ def _rule_storage(res: dict) -> list[dict]:
         ))
     if res.get("blob_soft_delete_enabled") is False:
         out.append(_issue(
-            res, severity="low", category="Misconfigured",
+            res, severity="low", category="Security Risk",
             issue="Blob soft-delete is disabled — accidental deletions are unrecoverable (data-loss risk).",
             fix_commands=["az storage blob service-properties delete-policy update --account-name {name} --enable true --days-retained 7"],
             savings_ratio=0, is_security_only=True,
@@ -1380,7 +1469,7 @@ def _rule_keyvault(res: dict) -> list[dict]:
     if res.get("kv_expiring_certs"):
         certs = ", ".join(res["kv_expiring_certs"])
         out.append(_issue(
-            res, severity="medium", category="Misconfigured",
+            res, severity="medium", category="Security Risk",
             issue=f"Certificate(s) expiring within 60 days: {certs}. Renew to avoid outage.",
             fix_commands=["# Renew the expiring certificate(s) in Key Vault"],
             savings_ratio=0, is_security_only=True,
