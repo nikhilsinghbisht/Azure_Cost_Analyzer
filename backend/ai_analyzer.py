@@ -960,11 +960,20 @@ def analyze_resources(
     # finding with $0 estimated savings is just noise (e.g. a correctly-configured
     # resource reported as "already optimal"). Risk/hygiene/governance findings
     # are kept even at $0 because they reduce RISK, not cost.
-    _RISK_CATEGORIES = {"security", "performance", "idle"}
+    _RISK_CATEGORIES = {"security", "performance", "idle", "governance"}
     cleaned = []
     for i in issues:
         cat = canonical_category(i.get("category")).lower()
         savings = i.get("estimated_monthly_savings_usd") or 0
+        # Never leave a $0 finding labelled Cost Saving — re-tag if needed.
+        if savings <= 0 and cat == "cost saving":
+            text = f"{i.get('issue') or ''} {i.get('title') or ''}".lower()
+            if any(k in text for k in ("security", "nsg", "tls", "https", "public access", "firewall", "ssh", "rdp", "purge", "soft-delete", "certificate")):
+                i["category"] = "Security"
+                cat = "security"
+            elif any(k in text for k in ("tag", "governance", "costcenter", "owner")):
+                i["category"] = "Governance"
+                cat = "governance"
         if cat in _RISK_CATEGORIES or i.get("_keep_at_zero"):
             cleaned.append(i)          # always keep risk / governance findings
         elif savings > 0:
