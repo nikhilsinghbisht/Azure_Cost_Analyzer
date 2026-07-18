@@ -23,16 +23,20 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   const res = await fetch(`${BASE}${path}`, { ...options, headers });
 
-  // Global 401 handler: expired / invalid token → wipe state and force login
-  if (res.status === 401) {
-    clearAuth();
-    window.location.replace('/login');
-    throw new ApiError('Session expired. Please log in again.', 401);
-  }
-
   if (!res.ok) {
     const body = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
-    throw new ApiError(body.detail ?? `HTTP ${res.status}`, res.status);
+    const detail = typeof body.detail === 'string' ? body.detail : `HTTP ${res.status}`;
+
+    // Only treat 401 as "session expired" on protected APIs — not on login/signup
+    // (those also return 401 for wrong password, which is not an expired session).
+    const isAuthEndpoint = path.startsWith('/api/auth/');
+    if (res.status === 401 && !isAuthEndpoint) {
+      clearAuth();
+      window.location.replace('/login');
+      throw new ApiError(detail || 'Session expired. Please log in again.', 401);
+    }
+
+    throw new ApiError(detail, res.status);
   }
 
   return res.json() as Promise<T>;
