@@ -139,8 +139,13 @@ manager = ConnectionManager()
 def _map_cli_error(exc: AzureCLIError) -> HTTPException:
     if isinstance(exc, AzureCLINotInstalledError):
         return HTTPException(status_code=503, detail=str(exc))
+    # Azure SP/token failure is a server config problem — NOT a user JWT expiry.
+    # Returning 401 here made the frontend wipe the login and show "session expired".
     if isinstance(exc, AzureNotLoggedInError):
-        return HTTPException(status_code=401, detail=str(exc))
+        return HTTPException(
+            status_code=503,
+            detail=f"Azure authentication failed: {exc}. Check AZURE_CLIENT_ID / SECRET / TENANT_ID.",
+        )
     if isinstance(exc, AzureResourceGroupNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
     return HTTPException(status_code=500, detail=str(exc))
