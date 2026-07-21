@@ -65,8 +65,8 @@ _HERE = Path(__file__).parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from ai_analyzer import analyze_resources
-from azure_scanner import (
+from cost_analysis import analyze_resources
+from resource_inventory import (
     AzureCLIError,
     get_resource_costs,
     list_resource_groups,
