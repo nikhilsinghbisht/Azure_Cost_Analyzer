@@ -8,10 +8,10 @@ Request flow
   ①  POST /api/auth/signup  — create account, return JWT
   ①  POST /api/auth/login   — validate credentials, return JWT
   POST /api/analyze  (auth required)
-    ③  azure_scanner  — az CLI scan of the resource group
-    ④  db             — create analysis row (status=running)
-    ⑤  ai_analyzer   — OpenAI gpt-4o cost analysis
-    ⑥  db             — update row with full results (status=completed)
+    ③  resource_inventory — scan resource group
+    ④  db                  — create analysis row (status=running)
+    ⑤  cost_analysis       — rules + AI cost analysis
+    ⑥  db                  — update row with full results (status=completed)
   GET  /api/resource-groups  (auth required)
   GET  /api/history          (auth required — scoped to calling user)
   WS   /ws/progress/{analysis_id} — live progress stream
@@ -30,9 +30,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr
 
-from ai_analyzer import AIAnalyzerError, OpenAIKeyMissingError, analyze_resources
+from cost_analysis import AIAnalyzerError, OpenAIKeyMissingError, analyze_resources
 from auth import create_token, get_current_user, hash_password, verify_password
-from azure_scanner import (
+from resource_inventory import (
     AzureCLIError,
     AzureCLINotInstalledError,
     AzureNotLoggedInError,
