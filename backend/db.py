@@ -6,8 +6,9 @@ asyncpg connection pool and query helpers for Azure Managed PostgreSQL.
 Tables
 ------
   users     — id, email, password_hash, created_at
-  analyses  — id, user_id, resource_group, resources_scanned, issues_found,
-              estimated_savings, analysis_result (jsonb), status, created_at
+  analyses  — id, user_id, resource_group, subscription_id, subscription_name,
+              resources_scanned, issues_found, estimated_savings,
+              estimated_savings_usd, analysis_result (jsonb), status, created_at
 """
 
 from __future__ import annotations
@@ -25,6 +26,12 @@ load_dotenv()
 
 # Module-level pool reference — initialised in init_pool(), torn down in close_pool()
 _pool: asyncpg.Pool | None = None
+
+_ANALYSES_COLS = """
+    id, user_id, resource_group, subscription_id, subscription_name,
+    resources_scanned, issues_found, estimated_savings, estimated_savings_usd,
+    analysis_result, status, created_at
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -96,15 +103,18 @@ CREATE TABLE IF NOT EXISTS users (
 
 _DDL_ANALYSES = """
 CREATE TABLE IF NOT EXISTS analyses (
-    id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id           UUID        REFERENCES users(id) ON DELETE SET NULL,
-    resource_group    TEXT        NOT NULL,
-    resources_scanned INT         NOT NULL DEFAULT 0,
-    issues_found      INT         NOT NULL DEFAULT 0,
-    estimated_savings TEXT,
-    analysis_result   JSONB,
-    status            TEXT        NOT NULL DEFAULT 'pending',
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id                    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id               UUID        REFERENCES users(id) ON DELETE SET NULL,
+    resource_group        TEXT        NOT NULL,
+    subscription_id       TEXT,
+    subscription_name     TEXT,
+    resources_scanned     INT         NOT NULL DEFAULT 0,
+    issues_found          INT         NOT NULL DEFAULT 0,
+    estimated_savings     TEXT,
+    estimated_savings_usd DOUBLE PRECISION,
+    analysis_result       JSONB,
+    status                TEXT        NOT NULL DEFAULT 'pending',
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
@@ -113,6 +123,51 @@ async def _create_tables() -> None:
     async with get_pool().acquire() as conn:
         await conn.execute(_DDL_USERS)
         await conn.execute(_DDL_ANALYSES)
+        # Existing DBs: add columns without rewriting analysis logic.
+        await conn.execute(
+            "ALTER TABLE analyses ADD COLUMN IF NOT EXISTS subscription_id TEXT"
+        )
+        await conn.execute(
+            "ALTER TABLE analyses ADD COLUMN IF NOT EXISTS subscription_name TEXT"
+        )
+        await conn.execute(
+            "ALTER TABLE analyses ADD COLUMN IF NOT EXISTS estimated_savings_usd DOUBLE PRECISION"
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS analyses_sub_rg_created_idx
+              ON analyses (subscription_id, resource_group, created_at DESC)
+            """
+        )
+        # Fix legacy double-encoded JSONB strings so ->'issues' works in Grafana.
+        await conn.execute(
+            """
+            UPDATE analyses
+            SET analysis_result = (analysis_result #>> '{}')::jsonb
+            WHERE analysis_result IS NOT NULL
+              AND jsonb_typeof(analysis_result) = 'string'
+            """
+        )
+        await conn.execute(
+            """
+            UPDATE analyses
+            SET
+              subscription_id = COALESCE(
+                  NULLIF(subscription_id, ''),
+                  NULLIF(analysis_result->>'subscription_id', '')
+              ),
+              subscription_name = COALESCE(
+                  NULLIF(subscription_name, ''),
+                  NULLIF(analysis_result->>'subscription_name', '')
+              ),
+              estimated_savings_usd = COALESCE(
+                  estimated_savings_usd,
+                  NULLIF(analysis_result->>'total_estimated_monthly_savings_usd', '')::double precision
+              )
+            WHERE analysis_result IS NOT NULL
+              AND jsonb_typeof(analysis_result) = 'object'
+            """
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +208,8 @@ async def create_analysis(
     analysis_id: str,
     resource_group: str,
     user_id: str | None = None,
+    subscription_id: str | None = None,
+    subscription_name: str | None = None,
 ) -> dict[str, Any]:
     """
     Insert a new analysis row with status='running'.
@@ -160,16 +217,18 @@ async def create_analysis(
     """
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            """
-            INSERT INTO analyses (id, user_id, resource_group, status)
-            VALUES ($1, $2, $3, 'running')
-            RETURNING id, user_id, resource_group, resources_scanned,
-                      issues_found, estimated_savings, analysis_result,
-                      status, created_at
+            f"""
+            INSERT INTO analyses (
+                id, user_id, resource_group, subscription_id, subscription_name, status
+            )
+            VALUES ($1, $2, $3, $4, $5, 'running')
+            RETURNING {_ANALYSES_COLS}
             """,
             uuid.UUID(analysis_id),
             uuid.UUID(user_id) if user_id else None,
             resource_group,
+            subscription_id,
+            subscription_name,
         )
     return _row_to_dict(row)
 
@@ -181,20 +240,36 @@ async def update_analysis(
     resources_scanned: int = 0,
     issues_found: int = 0,
     estimated_savings: str | None = None,
+    estimated_savings_usd: float | None = None,
     analysis_result: dict[str, Any] | None = None,
+    subscription_id: str | None = None,
+    subscription_name: str | None = None,
 ) -> None:
     """Update progress fields and final status on an existing analysis row."""
-    result_json = json.dumps(analysis_result) if analysis_result is not None else None
+    if analysis_result is not None:
+        if estimated_savings_usd is None:
+            raw = analysis_result.get("total_estimated_monthly_savings_usd")
+            if isinstance(raw, (int, float)):
+                estimated_savings_usd = float(raw)
+        if not subscription_id:
+            subscription_id = analysis_result.get("subscription_id") or None
+        if not subscription_name:
+            subscription_name = analysis_result.get("subscription_name") or None
 
+    # Pass dict directly (asyncpg jsonb codec). Do not json.dumps — that
+    # double-encodes and breaks Grafana JSON operators.
     async with get_pool().acquire() as conn:
         await conn.execute(
             """
             UPDATE analyses
-            SET status            = $2,
-                resources_scanned = $3,
-                issues_found      = $4,
-                estimated_savings = $5,
-                analysis_result   = $6::jsonb
+            SET status                = $2,
+                resources_scanned     = $3,
+                issues_found          = $4,
+                estimated_savings     = $5,
+                estimated_savings_usd = COALESCE($6, estimated_savings_usd),
+                analysis_result       = $7,
+                subscription_id       = COALESCE($8, subscription_id),
+                subscription_name     = COALESCE($9, subscription_name)
             WHERE id = $1
             """,
             uuid.UUID(analysis_id),
@@ -202,7 +277,10 @@ async def update_analysis(
             resources_scanned,
             issues_found,
             estimated_savings,
-            result_json,
+            estimated_savings_usd,
+            analysis_result,
+            subscription_id,
+            subscription_name,
         )
 
 
@@ -213,27 +291,43 @@ async def get_today_analysis(resource_group: str, subscription_id: str | None = 
     the AI when a result already exists for today.
     """
     async with get_pool().acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, user_id, resource_group, resources_scanned,
-                   issues_found, estimated_savings, analysis_result,
-                   status, created_at
-            FROM   analyses
-            WHERE  resource_group = $1
-              AND  status = 'completed'
-              AND  created_at >= NOW()::date
-            ORDER  BY created_at DESC
-            LIMIT  1
-            """,
-            resource_group,
-        )
+        if subscription_id:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {_ANALYSES_COLS}
+                FROM   analyses
+                WHERE  resource_group = $1
+                  AND  status = 'completed'
+                  AND  created_at >= NOW()::date
+                  AND  (subscription_id IS NULL OR subscription_id = $2)
+                ORDER  BY created_at DESC
+                LIMIT  1
+                """,
+                resource_group,
+                subscription_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {_ANALYSES_COLS}
+                FROM   analyses
+                WHERE  resource_group = $1
+                  AND  status = 'completed'
+                  AND  created_at >= NOW()::date
+                ORDER  BY created_at DESC
+                LIMIT  1
+                """,
+                resource_group,
+            )
     if not row:
         return None
     result = _row_to_dict(row)
-    # If a subscription filter is given, make sure this result matches
     if subscription_id:
-        ar = result.get("analysis_result") or {}
-        if ar.get("subscription_id") and ar["subscription_id"] != subscription_id:
+        stored = result.get("subscription_id") or (
+            (result.get("analysis_result") or {}).get("subscription_id")
+            if isinstance(result.get("analysis_result"), dict) else None
+        )
+        if stored and stored != subscription_id:
             return None
     return result
 
@@ -242,10 +336,8 @@ async def get_analysis_by_id(analysis_id: str) -> dict[str, Any] | None:
     """Return a single analysis row by its UUID, or None if not found."""
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            """
-            SELECT id, user_id, resource_group, resources_scanned,
-                   issues_found, estimated_savings, analysis_result,
-                   status, created_at
+            f"""
+            SELECT {_ANALYSES_COLS}
             FROM   analyses
             WHERE  id = $1
             """,
@@ -262,10 +354,8 @@ async def get_analyses(user_id: str | None = None) -> list[dict[str, Any]]:
     async with get_pool().acquire() as conn:
         if user_id:
             rows = await conn.fetch(
-                """
-                SELECT id, user_id, resource_group, resources_scanned,
-                       issues_found, estimated_savings, analysis_result,
-                       status, created_at
+                f"""
+                SELECT {_ANALYSES_COLS}
                 FROM   analyses
                 WHERE  user_id = $1
                 ORDER  BY created_at DESC
@@ -274,10 +364,8 @@ async def get_analyses(user_id: str | None = None) -> list[dict[str, Any]]:
             )
         else:
             rows = await conn.fetch(
-                """
-                SELECT id, user_id, resource_group, resources_scanned,
-                       issues_found, estimated_savings, analysis_result,
-                       status, created_at
+                f"""
+                SELECT {_ANALYSES_COLS}
                 FROM   analyses
                 ORDER  BY created_at DESC
                 """
