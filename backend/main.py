@@ -228,9 +228,15 @@ async def analyze_resource_group(
 
     user_id: str = current_user["sub"]
     analysis_id = body.analysis_id or str(uuid.uuid4())
+    subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID") or None
 
     # ④ Create pending row
-    await create_analysis(analysis_id=analysis_id, resource_group=rg, user_id=user_id)
+    await create_analysis(
+        analysis_id=analysis_id,
+        resource_group=rg,
+        user_id=user_id,
+        subscription_id=subscription_id,
+    )
 
     # ③ Azure CLI scan
     await manager.push(analysis_id, "Fetching resource groups...")
@@ -263,6 +269,8 @@ async def analyze_resource_group(
 
     # Attach the raw cost breakdown so the Report page can render it
     analysis["actual_cost_breakdown"] = actual_costs
+    if subscription_id:
+        analysis["subscription_id"] = subscription_id
 
     await update_analysis(
         analysis_id,
@@ -270,7 +278,9 @@ async def analyze_resource_group(
         resources_scanned=len(resources),
         issues_found=issues_found,
         estimated_savings=estimated_savings_str,
+        estimated_savings_usd=float(raw_savings) if isinstance(raw_savings, (int, float)) else None,
         analysis_result=analysis,
+        subscription_id=subscription_id,
     )
 
     await manager.push(analysis_id, "Analysis complete")
