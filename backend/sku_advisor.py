@@ -15,8 +15,7 @@ this module derives candidate cheaper sizes by:
      Burstable B-series equivalent, and pricing each against the LIVE retail API.
   4. Ranking survivors by real monthly cost difference.
 
-Prices come from rules_engine._vm_prices (live retail API, cached). This keeps a
-single source of truth for pricing and avoids a second HTTP path.
+Prices come from finding_rules._vm_prices (live retail API, cached).
 """
 
 from __future__ import annotations
@@ -95,7 +94,7 @@ def cheaper_alternatives(
     Each item: {size, vcpu, family, monthly_usd, saving_usd, saving_pct, kind}.
     Empty list if the current size can't be parsed/priced or nothing is cheaper.
     """
-    from rules_engine import _vm_prices  # lazy import to avoid a cycle
+    from finding_rules import _vm_prices  # lazy import to avoid a cycle
 
     parsed = _parse_size(current_size)
     if not parsed:
