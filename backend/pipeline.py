@@ -115,6 +115,7 @@ async def _db_save(
     analysis: dict,
     *,
     subscription_id: str | None = None,
+    subscription_name: str | None = None,
 ) -> None:
     """Persist an analysis to the database (best-effort)."""
     from db import create_analysis, update_analysis
@@ -124,6 +125,8 @@ async def _db_save(
             analysis_id=analysis_id,
             resource_group=resource_group,
             user_id=None,
+            subscription_id=subscription_id,
+            subscription_name=subscription_name,
         )
         issues_found = len(analysis.get("issues", []))
         raw_savings  = analysis.get("total_estimated_monthly_savings_usd")
@@ -131,6 +134,8 @@ async def _db_save(
 
         if subscription_id:
             analysis["subscription_id"] = subscription_id
+        if subscription_name:
+            analysis["subscription_name"] = subscription_name
 
         await update_analysis(
             analysis_id,
@@ -138,7 +143,10 @@ async def _db_save(
             resources_scanned=len(resources),
             issues_found=issues_found,
             estimated_savings=savings_str,
+            estimated_savings_usd=float(raw_savings) if isinstance(raw_savings, (int, float)) else None,
             analysis_result=analysis,
+            subscription_id=subscription_id,
+            subscription_name=subscription_name,
         )
         log.info("  ✔ Saved to DB  analysis_id=%s", analysis_id)
     except Exception as exc:
@@ -386,6 +394,7 @@ async def run_pipeline(
                     resources=resources,
                     analysis=analysis,
                     subscription_id=sub_id,
+                    subscription_name=sub_name,
                 )
 
             summary.append(entry)
